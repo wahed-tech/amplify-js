@@ -1,5 +1,5 @@
 {
-  "name": "@aws-amplify/auth",
+  "name": "@wahed/awsamplify-auth",
   "version": "4.0.2",
   "description": "Auth category of aws-amplify",
   "main": "./lib/index.js",
@@ -16,7 +16,7 @@
     "./dist/aws-amplify-auth.min.js"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "restricted"
   },
   "scripts": {
     "test": "yarn lint && jest -w 1 --coverage",
