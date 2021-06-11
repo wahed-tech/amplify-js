@@ -608,6 +608,7 @@ export class AuthClass {
 	private signInWithPassword(
 		authDetails: AuthenticationDetails
 	): Promise<CognitoUser | any> {
+		console.info('AWS: SignInWithPassword Reverted');
 		const user = this.createCognitoUser(authDetails.getUsername());
 
 		return new Promise((resolve, reject) => {
@@ -2121,7 +2122,8 @@ export class AuthClass {
 					attribute.Name === 'email_verified' ||
 					attribute.Name === 'phone_number_verified'
 				) {
-					obj[attribute.Name] = this.isTruthyString(attribute.Value) || attribute.Value === true;
+					obj[attribute.Name] =
+						this.isTruthyString(attribute.Value) || attribute.Value === true;
 				} else {
 					obj[attribute.Name] = attribute.Value;
 				}
@@ -2131,7 +2133,9 @@ export class AuthClass {
 	}
 
 	private isTruthyString(value: any): boolean {
-		return typeof value.toLowerCase === 'function' && value.toLowerCase() === 'true';
+		return (
+			typeof value.toLowerCase === 'function' && value.toLowerCase() === 'true'
+		);
 	}
 
 	private createCognitoUser(username: string): CognitoUser {
