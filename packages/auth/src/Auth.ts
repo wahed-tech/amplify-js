@@ -466,6 +466,7 @@ export class AuthClass {
 		pw?: string,
 		clientMetadata: ClientMetaData = this._config.clientMetadata
 	): Promise<CognitoUser | any> {
+		logger.warn('AWS: SignIn Reverted');
 		if (!this.userPool) {
 			return this.rejectNoUserPool();
 		}
@@ -608,7 +609,7 @@ export class AuthClass {
 	private signInWithPassword(
 		authDetails: AuthenticationDetails
 	): Promise<CognitoUser | any> {
-		console.info('AWS: SignInWithPassword Reverted');
+		logger.warn('AWS: SignInWithPassword Reverted');
 		const user = this.createCognitoUser(authDetails.getUsername());
 
 		return new Promise((resolve, reject) => {
