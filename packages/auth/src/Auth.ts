@@ -96,7 +96,6 @@ export class AuthClass {
 	private _storage;
 	private _storageSync;
 	private oAuthFlowInProgress: boolean = false;
-	private pendingSignIn: ReturnType<AuthClass['signInWithPassword']> | null;
 
 	Credentials = Credentials;
 
@@ -609,30 +608,14 @@ export class AuthClass {
 	private signInWithPassword(
 		authDetails: AuthenticationDetails
 	): Promise<CognitoUser | any> {
-		if (this.pendingSignIn) {
-			throw new Error('Pending sign-in attempt already in progress');
-		}
-
 		const user = this.createCognitoUser(authDetails.getUsername());
 
-		this.pendingSignIn = new Promise((resolve, reject) => {
+		return new Promise((resolve, reject) => {
 			user.authenticateUser(
 				authDetails,
-				this.authCallbacks(
-					user,
-					value => {
-						this.pendingSignIn = null;
-						resolve(value);
-					},
-					error => {
-						this.pendingSignIn = null;
-						reject(error);
-					}
-				)
+				this.authCallbacks(user, resolve, reject)
 			);
 		});
-
-		return this.pendingSignIn;
 	}
 
 	/**
@@ -2138,7 +2121,8 @@ export class AuthClass {
 					attribute.Name === 'email_verified' ||
 					attribute.Name === 'phone_number_verified'
 				) {
-					obj[attribute.Name] = this.isTruthyString(attribute.Value) || attribute.Value === true;
+					obj[attribute.Name] =
+						this.isTruthyString(attribute.Value) || attribute.Value === true;
 				} else {
 					obj[attribute.Name] = attribute.Value;
 				}
@@ -2148,7 +2132,9 @@ export class AuthClass {
 	}
 
 	private isTruthyString(value: any): boolean {
-		return typeof value.toLowerCase === 'function' && value.toLowerCase() === 'true';
+		return (
+			typeof value.toLowerCase === 'function' && value.toLowerCase() === 'true'
+		);
 	}
 
 	private createCognitoUser(username: string): CognitoUser {
