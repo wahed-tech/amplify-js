@@ -1,5 +1,5 @@
 {
-  "name": "@wahed/amplify-auth",
+  "name": "@wahed/awsamplify-auth",
   "version": "4.0.2",
   "description": "Auth category of aws-amplify",
   "main": "./lib/index.js",
