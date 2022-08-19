@@ -1,5 +1,5 @@
 /*
- * Copyright 2017-2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright 2017-2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance with
  * the License. A copy of the License is located at
@@ -18,20 +18,48 @@ import axios, {
 	AxiosRequestConfig,
 	Method,
 	CancelTokenSource,
-	AxiosTransformer,
+	AxiosRequestHeaders,
+	AxiosRequestTransformer,
 } from 'axios';
 import { ConsoleLogger as Logger, Platform } from '@aws-amplify/core';
 import { FetchHttpHandlerOptions } from '@aws-sdk/fetch-http-handler';
+import * as events from 'events';
+import { AWSS3ProviderUploadErrorStrings } from '../common/StorageErrorStrings';
+
+/**
+Extending the axios interface here to make headers required, (previously, 
+they were not required on the type we were using, but our implementation
+does not currently account for missing headers. This worked previously, 
+because the previous `headers` type was `any`.
+*/
+interface AxiosTransformer extends Partial<AxiosRequestTransformer> {
+	(data: any, headers: AxiosRequestHeaders): any;
+}
 
 const logger = new Logger('axios-http-handler');
-export const SEND_PROGRESS_EVENT = 'sendProgress';
+export const SEND_UPLOAD_PROGRESS_EVENT = 'sendUploadProgress';
+export const SEND_DOWNLOAD_PROGRESS_EVENT = 'sendDownloadProgress';
+
+export type ErrorWithResponse = {
+	response: { status: number } & { [key: string]: any };
+};
 
 function isBlob(body: any): body is Blob {
 	return typeof Blob !== 'undefined' && body instanceof Blob;
 }
 
+function hasErrorResponse(error: any): error is ErrorWithResponse {
+	return (
+		typeof error !== 'undefined' &&
+		Object.prototype.hasOwnProperty.call(error, 'response') &&
+		typeof error.response !== 'undefined' &&
+		Object.prototype.hasOwnProperty.call(error.response, 'status') &&
+		typeof error.response.status === 'number'
+	);
+}
+
 const normalizeHeaders = (
-	headers: Record<string, string>,
+	headers: AxiosRequestHeaders,
 	normalizedName: string
 ) => {
 	for (const [k, v] of Object.entries(headers)) {
@@ -46,7 +74,7 @@ const normalizeHeaders = (
 };
 
 export const reactNativeRequestTransformer: AxiosTransformer[] = [
-	function(data, headers) {
+	(data: any, headers: AxiosRequestHeaders): any => {
 		if (isBlob(data)) {
 			normalizeHeaders(headers, 'Content-Type');
 			normalizeHeaders(headers, 'Accept');
@@ -57,10 +85,15 @@ export const reactNativeRequestTransformer: AxiosTransformer[] = [
 	},
 ];
 
+export type AxiosHttpHandlerOptions = HttpHandlerOptions & {
+	cancelTokenSource?: CancelTokenSource;
+	emitter?: events.EventEmitter;
+};
+
 export class AxiosHttpHandler implements HttpHandler {
 	constructor(
 		private readonly httpOptions: FetchHttpHandlerOptions = {},
-		private readonly emitter?: any,
+		private readonly emitter?: events.EventEmitter,
 		private readonly cancelTokenSource?: CancelTokenSource
 	) {}
 
@@ -71,10 +104,12 @@ export class AxiosHttpHandler implements HttpHandler {
 
 	handle(
 		request: HttpRequest,
-		options: HttpHandlerOptions
+		options: AxiosHttpHandlerOptions
 	): Promise<{ response: HttpResponse }> {
 		const requestTimeoutInMs = this.httpOptions.requestTimeout;
-		const emitter = this.emitter;
+		// prioritize the call specific event emitter, this is useful for multipart upload as each individual parts has
+		// their own event emitter, without having to create s3client for every individual calls.
+		const emitter = options.emitter || this.emitter;
 
 		let path = request.path;
 		if (request.query) {
@@ -116,13 +151,25 @@ export class AxiosHttpHandler implements HttpHandler {
 			// removing the content-type header. Link for the source code
 			// https://github.com/axios/axios/blob/dc4bc49673943e35280e5df831f5c3d0347a9393/lib/adapters/xhr.js#L121-L123
 
-			if (axiosRequest.headers['Content-Type']) {
+			if (
+				axiosRequest.headers[
+					Object.keys(axiosRequest.headers).find(
+						key => key.toLowerCase() === 'content-type'
+					)
+				]
+			) {
 				axiosRequest.data = null;
 			}
 		}
 		if (emitter) {
+			// TODO: Unify linting rules across JS repo
 			axiosRequest.onUploadProgress = function(event) {
-				emitter.emit(SEND_PROGRESS_EVENT, event);
+				emitter.emit(SEND_UPLOAD_PROGRESS_EVENT, event);
+				logger.debug(event);
+			};
+			// TODO: Unify linting rules across JS repo
+			axiosRequest.onDownloadProgress = function(event) {
+				emitter.emit(SEND_DOWNLOAD_PROGRESS_EVENT, event);
 				logger.debug(event);
 			};
 		}
@@ -131,11 +178,14 @@ export class AxiosHttpHandler implements HttpHandler {
 			axiosRequest.cancelToken = this.cancelTokenSource.token;
 		}
 
+		if (options.cancelTokenSource) {
+			axiosRequest.cancelToken = options.cancelTokenSource.token;
+		}
+
 		// From gamma release, aws-sdk now expects all response type to be of blob or streams
 		axiosRequest.responseType = 'blob';
-		
 		// In Axios, Blobs are identified by calling Object.prototype.toString on the object. However, on React Native,
-		// calling Object.prototype.toString on a Blob returns '[object Object]' instead of '[object Blob]', which causes 
+		// calling Object.prototype.toString on a Blob returns '[object Object]' instead of '[object Blob]', which causes
 		// Axios to treat Blobs as generic Javascript objects. Therefore we need a to use a custom request transformer
 		// to correctly handle Blob in React Native.
 		if (Platform.isReactNative) {
@@ -156,8 +206,30 @@ export class AxiosHttpHandler implements HttpHandler {
 				})
 				.catch(error => {
 					// Error
-					logger.error(error);
-					throw error;
+					if (
+						error.message !==
+						AWSS3ProviderUploadErrorStrings.UPLOAD_PAUSED_MESSAGE
+					) {
+						logger.error(error.message);
+					}
+					// for axios' cancel error, we should re-throw it back so it's not considered an s3client error
+					// if we return empty, or an abitrary error HttpResponse, it will be hard to debug down the line.
+					//
+					// for errors that does not have a 'response' object, it's very likely that it is an unexpected error for
+					// example a disconnect. Without it we cannot meaningfully reconstruct a HttpResponse, and the AWS SDK might
+					// consider the request successful by mistake. In this case we should also re-throw the error.
+					if (axios.isCancel(error) || !hasErrorResponse(error)) {
+						throw error;
+					}
+					// otherwise, we should re-construct an HttpResponse from the error, so that it can be passed down to other
+					// aws sdk middleware (e.g retry, clock skew correction, error message serializing)
+					return {
+						response: new HttpResponse({
+							statusCode: error.response.status,
+							body: error.response?.data,
+							headers: error.response?.headers,
+						}),
+					};
 				}),
 			requestTimeout(requestTimeoutInMs),
 		];

@@ -2,10 +2,12 @@ import AsyncStorageAdapter from '../src/storage/adapter/AsyncStorageAdapter';
 import {
 	DataStore as DataStoreType,
 	initSchema as initSchemaType,
+	syncClasses,
 } from '../src/datastore/datastore';
 import { PersistentModelConstructor, SortDirection } from '../src/types';
-import { Model, User, Profile, testSchema } from './helpers';
+import { pause, Model, User, Profile, testSchema } from './helpers';
 import { Predicates } from '../src/predicates';
+import { addCommonQueryTests } from './commonAdapterTests';
 
 let initSchema: typeof initSchemaType;
 let DataStore: typeof DataStoreType;
@@ -13,6 +15,29 @@ let DataStore: typeof DataStoreType;
 const ASAdapter = <any>AsyncStorageAdapter;
 
 describe('AsyncStorageAdapter tests', () => {
+	beforeEach(() => {
+		jest.clearAllMocks();
+	});
+
+	async function getMutations(adapter) {
+		await pause(250);
+		return await adapter.getAll('sync_MutationEvent');
+	}
+
+	async function clearOutbox(adapter) {
+		await pause(250);
+		return await adapter.delete(syncClasses['MutationEvent']);
+	}
+
+	({ initSchema, DataStore } = require('../src/datastore/datastore'));
+	addCommonQueryTests({
+		initSchema,
+		DataStore,
+		storageAdapter: AsyncStorageAdapter,
+		getMutations,
+		clearOutbox,
+	});
+
 	describe('Query', () => {
 		let Model: PersistentModelConstructor<Model>;
 		let model1Id: string;
@@ -36,28 +61,35 @@ describe('AsyncStorageAdapter tests', () => {
 				Model: PersistentModelConstructor<Model>;
 			});
 
+			// NOTE: sort() test on these models can be flaky unless we
+			// strictly control the datestring of each! In a non-negligible percentage
+			// of test runs on a reasonably fast machine, DataStore.save() seemed to return
+			// quickly enough that dates were colliding. (or so it seemed!)
+
+			const baseDate = new Date();
+
 			({ id: model1Id } = await DataStore.save(
 				new Model({
 					field1: 'Some value',
-					dateCreated: new Date().toISOString(),
+					dateCreated: baseDate.toISOString(),
 				})
 			));
 			await DataStore.save(
 				new Model({
 					field1: 'another value',
-					dateCreated: new Date().toISOString(),
+					dateCreated: new Date(baseDate.getTime() + 1).toISOString(),
 				})
 			);
 			await DataStore.save(
 				new Model({
 					field1: 'a third value',
-					dateCreated: new Date().toISOString(),
+					dateCreated: new Date(baseDate.getTime() + 2).toISOString(),
 				})
 			);
 		});
 
-		beforeEach(() => {
-			jest.clearAllMocks();
+		afterAll(async () => {
+			await DataStore.clear();
 		});
 
 		it('Should call getById for query by id', async () => {
@@ -167,6 +199,52 @@ describe('AsyncStorageAdapter tests', () => {
 			// both should be undefined, even though we only explicitly deleted the user
 			expect(user).toBeUndefined;
 			expect(profile).toBeUndefined;
+		});
+	});
+
+	describe('Save', () => {
+		let User: PersistentModelConstructor<User>;
+		let Profile: PersistentModelConstructor<Profile>;
+		let profile: Profile;
+
+		beforeAll(async () => {
+			({ initSchema, DataStore } = require('../src/datastore/datastore'));
+
+			const classes = initSchema(testSchema());
+
+			({ User } = classes as {
+				User: PersistentModelConstructor<User>;
+			});
+
+			({ Profile } = classes as {
+				Profile: PersistentModelConstructor<Profile>;
+			});
+
+			profile = await DataStore.save(
+				new Profile({ firstName: 'Rick', lastName: 'Bob' })
+			);
+		});
+
+		it('should allow linking model via model field', async () => {
+			const savedUser = await DataStore.save(
+				new User({ name: 'test', profile })
+			);
+			const user1Id = savedUser.id;
+
+			const user = await DataStore.query(User, user1Id);
+			expect(user.profileID).toEqual(profile.id);
+			expect(user.profile).toEqual(profile);
+		});
+
+		it('should allow linking model via FK', async () => {
+			const savedUser = await DataStore.save(
+				new User({ name: 'test', profileID: profile.id })
+			);
+			const user1Id = savedUser.id;
+
+			const user = await DataStore.query(User, user1Id);
+			expect(user.profileID).toEqual(profile.id);
+			expect(user.profile).toEqual(profile);
 		});
 	});
 });

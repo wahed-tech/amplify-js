@@ -1,6 +1,7 @@
 import { Buffer } from 'buffer';
 import { monotonicFactory, ULID } from 'ulid';
 import { v4 as uuid } from 'uuid';
+import { produce, applyPatches, Patch } from 'immer';
 import { ModelInstanceCreator } from './datastore/datastore';
 import {
 	AllOperators,
@@ -22,8 +23,26 @@ import {
 	isModelAttributeKey,
 	isModelAttributePrimaryKey,
 	isModelAttributeCompositeKey,
+	NonModelTypeConstructor,
+	DeferredCallbackResolverOptions,
+	LimitTimerRaceResolvedValues,
 } from './types';
 import { WordArray } from 'amazon-cognito-identity-js';
+
+export enum NAMESPACES {
+	DATASTORE = 'datastore',
+	USER = 'user',
+	SYNC = 'sync',
+	STORAGE = 'storage',
+}
+
+const DATASTORE = NAMESPACES.DATASTORE;
+const USER = NAMESPACES.USER;
+const SYNC = NAMESPACES.SYNC;
+const STORAGE = NAMESPACES.STORAGE;
+
+export { USER, SYNC, STORAGE, DATASTORE };
+export const USER_AGENT_SUFFIX_DATASTORE = '/DataStore';
 
 export const exhaustiveCheck = (obj: never, throwOnError: boolean = true) => {
 	if (throwOnError) {
@@ -131,7 +150,19 @@ export const isModelConstructor = <T extends PersistentModel>(
 	);
 };
 
-/* 
+const nonModelClasses = new WeakSet<NonModelTypeConstructor<any>>();
+
+export function registerNonModelClass(clazz: NonModelTypeConstructor<any>) {
+	nonModelClasses.add(clazz);
+}
+
+export const isNonModelConstructor = (
+	obj: any
+): obj is NonModelTypeConstructor<any> => {
+	return nonModelClasses.has(obj);
+};
+
+/*
   When we have GSI(s) with composite sort keys defined on a model
 	There are some very particular rules regarding which fields must be included in the update mutation input
 	The field selection becomes more complex as the number of GSIs with composite sort keys grows
@@ -141,7 +172,7 @@ export const isModelConstructor = <T extends PersistentModel>(
 	 2. all of the fields from any other composite sort key that intersect with the fields from 1.
 
 	 E.g.,
-	 Model @model 
+	 Model @model
 		@key(name: 'key1' fields: ['hk', 'a', 'b', 'c'])
 		@key(name: 'key2' fields: ['hk', 'a', 'b', 'd'])
 		@key(name: 'key3' fields: ['hk', 'x', 'y', 'z'])
@@ -177,7 +208,7 @@ export const processCompositeKeys = (
 		.filter(isModelAttributeCompositeKey)
 		.map(extractCompositeSortKey);
 
-	/* 
+	/*
 		if 2 sets of fields have any intersecting fields => combine them into 1 union set
 		e.g., ['a', 'b', 'c'] and ['a', 'b', 'd'] => ['a', 'b', 'c', 'd']
 	*/
@@ -322,6 +353,7 @@ export const traverseModel = <T extends PersistentModel>(
 							);
 						} catch (error) {
 							// Do nothing
+							console.log(error);
 						}
 
 						result.push({
@@ -330,9 +362,20 @@ export const traverseModel = <T extends PersistentModel>(
 							instance: modelInstance,
 						});
 
-						(<any>draftInstance)[rItem.fieldName] = (<PersistentModel>(
-							draftInstance[rItem.fieldName]
-						)).id;
+						// targetName will be defined for Has One if feature flag
+						// https://docs.amplify.aws/cli/reference/feature-flags/#useAppsyncModelgenPlugin
+						// is true (default as of 5/7/21)
+						// Making this conditional for backward-compatibility
+						if (rItem.targetName) {
+							(<any>draftInstance)[rItem.targetName] = (<PersistentModel>(
+								draftInstance[rItem.fieldName]
+							)).id;
+							delete draftInstance[rItem.fieldName];
+						} else {
+							(<any>draftInstance)[rItem.fieldName] = (<PersistentModel>(
+								draftInstance[rItem.fieldName]
+							)).id;
+						}
 					}
 
 					break;
@@ -361,13 +404,12 @@ export const traverseModel = <T extends PersistentModel>(
 						}
 					}
 
-					(<any>draftInstance)[rItem.targetName] = draftInstance[
-						rItem.fieldName
-					]
-						? (<PersistentModel>draftInstance[rItem.fieldName]).id
-						: null;
-
-					delete draftInstance[rItem.fieldName];
+					if (draftInstance[rItem.fieldName]) {
+						(<any>draftInstance)[rItem.targetName] = (<PersistentModel>(
+							draftInstance[rItem.fieldName]
+						)).id;
+						delete draftInstance[rItem.fieldName];
+					}
 
 					break;
 				case 'HAS_MANY':
@@ -422,20 +464,6 @@ export const getIndexFromAssociation = (
 	return index;
 };
 
-export enum NAMESPACES {
-	DATASTORE = 'datastore',
-	USER = 'user',
-	SYNC = 'sync',
-	STORAGE = 'storage',
-}
-
-const DATASTORE = NAMESPACES.DATASTORE;
-const USER = NAMESPACES.USER;
-const SYNC = NAMESPACES.SYNC;
-const STORAGE = NAMESPACES.STORAGE;
-
-export { USER, SYNC, STORAGE, DATASTORE };
-
 let privateModeCheckResult;
 
 export const isPrivateMode = () => {
@@ -477,7 +505,7 @@ export const isPrivateMode = () => {
 	});
 };
 
-const randomBytes = function(nBytes: number): Buffer {
+const randomBytes = (nBytes: number): Buffer => {
 	return Buffer.from(new WordArray().random(nBytes).toString(), 'hex');
 };
 const prng = () => randomBytes(1).readUInt8(0) / 0xff;
@@ -669,3 +697,117 @@ export const isAWSIPAddress = (val: string): boolean => {
 		val
 	);
 };
+
+export class DeferredPromise {
+	public promise: Promise<string>;
+	public resolve: (value: string | PromiseLike<string>) => void;
+	public reject: () => void;
+	constructor() {
+		const self = this;
+		this.promise = new Promise(
+			(resolve: (value: string | PromiseLike<string>) => void, reject) => {
+				self.resolve = resolve;
+				self.reject = reject;
+			}
+		);
+	}
+}
+
+export class DeferredCallbackResolver {
+	private limitPromise = new DeferredPromise();
+	private timerPromise: Promise<string>;
+	private maxInterval: number;
+	private timer: ReturnType<typeof setTimeout>;
+	private raceInFlight = false;
+	private callback = () => {};
+	private errorHandler: (error: string) => void;
+	private defaultErrorHandler = (
+		msg = 'DeferredCallbackResolver error'
+	): void => {
+		throw new Error(msg);
+	};
+
+	constructor(options: DeferredCallbackResolverOptions) {
+		this.callback = options.callback;
+		this.errorHandler = options.errorHandler || this.defaultErrorHandler;
+		this.maxInterval = options.maxInterval || 2000;
+	}
+
+	private startTimer(): void {
+		this.timerPromise = new Promise((resolve, reject) => {
+			this.timer = setTimeout(() => {
+				resolve(LimitTimerRaceResolvedValues.TIMER);
+			}, this.maxInterval);
+		});
+	}
+
+	private async racePromises(): Promise<string> {
+		let winner: string;
+		try {
+			this.raceInFlight = true;
+			this.startTimer();
+			winner = await Promise.race([
+				this.timerPromise,
+				this.limitPromise.promise,
+			]);
+			this.callback();
+		} catch (err) {
+			this.errorHandler(err);
+		} finally {
+			// reset for the next race
+			this.clear();
+			this.raceInFlight = false;
+			this.limitPromise = new DeferredPromise();
+
+			return winner;
+		}
+	}
+
+	public start(): void {
+		if (!this.raceInFlight) this.racePromises();
+	}
+
+	public clear(): void {
+		clearTimeout(this.timer);
+	}
+
+	public resolve(): void {
+		this.limitPromise.resolve(LimitTimerRaceResolvedValues.LIMIT);
+	}
+}
+
+/**
+ * merge two sets of patches created by immer produce.
+ * newPatches take precedent over oldPatches for patches modifying the same path.
+ * In the case many consecutive pathces are merged the original model should
+ * always be the root model.
+ *
+ * Example:
+ * A -> B, patches1
+ * B -> C, patches2
+ *
+ * mergePatches(A, patches1, patches2) to get patches for A -> C
+ *
+ * @param originalSource the original Model the patches should be applied to
+ * @param oldPatches immer produce patch list
+ * @param newPatches immer produce patch list (will take precedence)
+ * @return merged patches
+ */
+export function mergePatches<T>(
+	originalSource: T,
+	oldPatches: Patch[],
+	newPatches: Patch[]
+): Patch[] {
+	const patchesToMerge = oldPatches.concat(newPatches);
+	let patches: Patch[];
+	produce(
+		originalSource,
+		draft => {
+			applyPatches(draft, patchesToMerge);
+		},
+		p => {
+			patches = p;
+		}
+	);
+	return patches;
+}

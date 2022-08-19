@@ -4,6 +4,8 @@ import {
 	AuthModeStrategy,
 	ModelAttributeAuthProperty,
 	ModelAttributeAuthProvider,
+	ModelAttributeAuthAllow,
+	AmplifyContext,
 } from '../types';
 
 function getProviderFromRule(
@@ -21,8 +23,20 @@ function getProviderFromRule(
 }
 
 function sortAuthRulesWithPriority(rules: ModelAttributeAuthProperty[]) {
-	const allowSortPriority = ['owner', 'groups', 'private', 'public'];
-	const providerSortPriority = ['userPools', 'oidc', 'iam', 'apiKey'];
+	const allowSortPriority = [
+		ModelAttributeAuthAllow.CUSTOM,
+		ModelAttributeAuthAllow.OWNER,
+		ModelAttributeAuthAllow.GROUPS,
+		ModelAttributeAuthAllow.PRIVATE,
+		ModelAttributeAuthAllow.PUBLIC,
+	];
+	const providerSortPriority = [
+		ModelAttributeAuthProvider.FUNCTION,
+		ModelAttributeAuthProvider.USER_POOLS,
+		ModelAttributeAuthProvider.OIDC,
+		ModelAttributeAuthProvider.IAM,
+		ModelAttributeAuthProvider.API_KEY,
+	];
 
 	return [...rules].sort(
 		(a: ModelAttributeAuthProperty, b: ModelAttributeAuthProperty) => {
@@ -51,35 +65,50 @@ function getAuthRules({
 
 	rules.forEach(rule => {
 		switch (rule.allow) {
-			case 'groups':
-			case 'owner': {
+			case ModelAttributeAuthAllow.CUSTOM:
+				// custom with no provider -> function
+				if (
+					!rule.provider ||
+					rule.provider === ModelAttributeAuthProvider.FUNCTION
+				) {
+					authModes.add(GRAPHQL_AUTH_MODE.AWS_LAMBDA);
+				}
+				break;
+			case ModelAttributeAuthAllow.GROUPS:
+			case ModelAttributeAuthAllow.OWNER: {
 				// We shouldn't attempt User Pool or OIDC if there isn't an authenticated user
 				if (currentUser) {
-					if (rule.provider === 'userPools') {
+					if (rule.provider === ModelAttributeAuthProvider.USER_POOLS) {
 						authModes.add(GRAPHQL_AUTH_MODE.AMAZON_COGNITO_USER_POOLS);
-					} else if (rule.provider === 'oidc') {
+					} else if (rule.provider === ModelAttributeAuthProvider.OIDC) {
 						authModes.add(GRAPHQL_AUTH_MODE.OPENID_CONNECT);
 					}
 				}
 				break;
 			}
-			case 'private': {
+			case ModelAttributeAuthAllow.PRIVATE: {
 				// We shouldn't attempt private if there isn't an authenticated user
 				if (currentUser) {
 					// private with no provider means userPools
-					if (!rule.provider || rule.provider === 'userPools') {
+					if (
+						!rule.provider ||
+						rule.provider === ModelAttributeAuthProvider.USER_POOLS
+					) {
 						authModes.add(GRAPHQL_AUTH_MODE.AMAZON_COGNITO_USER_POOLS);
-					} else if (rule.provider === 'iam') {
+					} else if (rule.provider === ModelAttributeAuthProvider.IAM) {
 						authModes.add(GRAPHQL_AUTH_MODE.AWS_IAM);
 					}
 				}
 
 				break;
 			}
-			case 'public': {
-				if (rule.provider === 'iam') {
+			case ModelAttributeAuthAllow.PUBLIC: {
+				if (rule.provider === ModelAttributeAuthProvider.IAM) {
 					authModes.add(GRAPHQL_AUTH_MODE.AWS_IAM);
-				} else if (!rule.provider || rule.provider === 'apiKey') {
+				} else if (
+					!rule.provider ||
+					rule.provider === ModelAttributeAuthProvider.API_KEY
+				) {
 					// public with no provider means apiKey
 					authModes.add(GRAPHQL_AUTH_MODE.API_KEY);
 				}
@@ -93,29 +122,31 @@ function getAuthRules({
 	return Array.from(authModes);
 }
 
-export const multiAuthStrategy: AuthModeStrategy = async ({
-	schema,
-	modelName,
-}) => {
-	let currentUser;
-	try {
-		currentUser = await Auth.currentAuthenticatedUser();
-	} catch (e) {
-		// No current user
-	}
-
-	const { attributes } = schema.namespaces.user.models[modelName];
-
-	if (attributes) {
-		const authAttribute = attributes.find(attr => attr.type === 'auth');
-
-		if (authAttribute.properties && authAttribute.properties.rules) {
-			const sortedRules = sortAuthRulesWithPriority(
-				authAttribute.properties.rules
-			);
-
-			return getAuthRules({ currentUser, rules: sortedRules });
+export const multiAuthStrategy: (
+	amplifyContext: AmplifyContext
+) => AuthModeStrategy =
+	(amplifyContext: AmplifyContext) =>
+	async ({ schema, modelName }) => {
+		amplifyContext.Auth = amplifyContext.Auth || Auth;
+		let currentUser;
+		try {
+			currentUser = await amplifyContext.Auth.currentAuthenticatedUser();
+		} catch (e) {
+			// No current user
 		}
-	}
-	return [];
-};
+
+		const { attributes } = schema.namespaces.user.models[modelName];
+
+		if (attributes) {
+			const authAttribute = attributes.find(attr => attr.type === 'auth');
+
+			if (authAttribute?.properties?.rules) {
+				const sortedRules = sortAuthRulesWithPriority(
+					authAttribute.properties.rules
+				);
+
+				return getAuthRules({ currentUser, rules: sortedRules });
+			}
+		}
+		return [];
+	};

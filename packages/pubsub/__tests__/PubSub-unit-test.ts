@@ -1,3 +1,14 @@
+jest.mock('@aws-amplify/core', () => ({
+	__esModule: true,
+	...jest.requireActual('@aws-amplify/core'),
+	browserOrNode() {
+		return {
+			isBrowser: true,
+			isNode: false,
+		};
+	},
+}));
+
 import { PubSubClass as PubSub } from '../src/PubSub';
 import {
 	MqttOverWSProvider,
@@ -8,9 +19,19 @@ import {
 // import Amplify from '../../src/';
 import {
 	Credentials,
+	Hub,
 	INTERNAL_AWS_APPSYNC_PUBSUB_PROVIDER,
+	Logger,
+	Reachability,
 } from '@aws-amplify/core';
 import * as Paho from 'paho-mqtt';
+import {
+	ConnectionState,
+	ConnectionState,
+	CONNECTION_STATE_CHANGE,
+} from '../src';
+import { HubConnectionListener } from './helpers';
+import Observable from 'zen-observable-ts';
 
 const pahoClientMockCache = {};
 
@@ -196,6 +217,41 @@ describe('PubSub', () => {
 			expect(mqttTopicMatch('topic/A/+/#', publishTopic)).toBe(true);
 			expect(mqttTopicMatch('topic/A/B/C/#', publishTopic)).toBe(false);
 		});
+
+		test('should remove AWSIoTProvider', () => {
+			const pubsub = new PubSub({});
+			const originalProvider = new AWSIoTProvider({
+				aws_pubsub_region: 'region',
+				aws_pubsub_endpoint: 'wss://iot.mymockendpoint.org:443/notrealmqtt',
+			});
+			jest.spyOn(originalProvider, 'publish');
+			const newProvider = new AWSIoTProvider({
+				aws_pubsub_region: 'new-region',
+				aws_pubsub_endpoint: 'wss://iot.newEndPoint.org:443/newEndPoint',
+			});
+			jest.spyOn(newProvider, 'publish');
+
+			pubsub.addPluggable(originalProvider);
+			pubsub.removePluggable('AWSIoTProvider');
+			pubsub.addPluggable(newProvider);
+			pubsub.publish('someTopic', { msg: 'published Message' });
+
+			expect(originalProvider.publish).not.toHaveBeenCalled();
+			expect(newProvider.publish).toHaveBeenCalled();
+		});
+
+		test('should exit gracefully when trying to remove provider when no providers have been added', () => {
+			const config = {
+				PubSub: {
+					aws_pubsub_region: 'region',
+					aws_pubsub_endpoint: 'wss://iot.mymockendpoint.org:443/notrealmqtt',
+				},
+			};
+			const pubsub = new PubSub({});
+			pubsub.configure(config);
+
+			expect(() => pubsub.removePluggable('AWSIoTProvider')).not.toThrow();
+		});
 	});
 
 	describe('MqttOverWSProvider', () => {
@@ -237,6 +293,145 @@ describe('PubSub', () => {
 			});
 
 			awsIotProvider.onDisconnect({ errorCode: 1, clientId: '123' });
+		});
+
+		test('should remove MqttOverWSProvider', () => {
+			const pubsub = new PubSub({});
+			const originalProvider = new MqttOverWSProvider({
+				aws_pubsub_region: 'region',
+				aws_appsync_dangerously_connect_to_http_endpoint_for_testing: true,
+			});
+			jest.spyOn(originalProvider, 'publish');
+			const newProvider = new MqttOverWSProvider({
+				aws_pubsub_region: 'region',
+				aws_appsync_dangerously_connect_to_http_endpoint_for_testing: true,
+			});
+			jest.spyOn(newProvider, 'publish');
+
+			pubsub.addPluggable(originalProvider);
+			pubsub.removePluggable('MqttOverWSProvider');
+			pubsub.addPluggable(newProvider);
+			pubsub.publish('someTopic', { msg: 'published Message' });
+
+			expect(originalProvider.publish).not.toHaveBeenCalled();
+			expect(newProvider.publish).toHaveBeenCalled();
+		});
+
+		describe('Hub connection state changes', () => {
+			let hubConnectionListener: HubConnectionListener;
+
+			let reachabilityObserver: ZenObservable.Observer<{ online: boolean }>;
+
+			beforeEach(() => {
+				// Maintain the Hub connection listener, used to monitor the connection messages sent through Hub
+				hubConnectionListener?.teardown();
+				hubConnectionListener = new HubConnectionListener('pubsub');
+
+				// Setup a mock of the reachability monitor where the initial value is online.
+				const spyon = jest
+					.spyOn(Reachability.prototype, 'networkMonitor')
+					.mockImplementationOnce(
+						() =>
+							new Observable(observer => {
+								reachabilityObserver = observer;
+							})
+					);
+				reachabilityObserver?.next?.({ online: true });
+			});
+
+			test('test happy case connect -> disconnect cycle', async () => {
+				const pubsub = new PubSub();
+
+				const awsIotProvider = new AWSIoTProvider({
+					aws_pubsub_region: 'region',
+					aws_pubsub_endpoint: 'wss://iot.mymockendpoint.org:443/notrealmqtt',
+				});
+				pubsub.addPluggable(awsIotProvider);
+
+				const sub = pubsub.subscribe('topic', { clientId: '123' }).subscribe({
+					error: () => {},
+				});
+
+				await hubConnectionListener.waitUntilConnectionStateIn(['Connected']);
+				sub.unsubscribe();
+				awsIotProvider.onDisconnect({ errorCode: 1, clientId: '123' });
+				await hubConnectionListener.waitUntilConnectionStateIn([
+					'Disconnected',
+				]);
+				expect(hubConnectionListener.observedConnectionStates).toEqual([
+					'Disconnected',
+					'Connecting',
+					'Connected',
+					'ConnectedPendingDisconnect',
+					'Disconnected',
+				]);
+			});
+
+			test('test network disconnection and recovery', async () => {
+				const pubsub = new PubSub();
+
+				const awsIotProvider = new AWSIoTProvider({
+					aws_pubsub_region: 'region',
+					aws_pubsub_endpoint: 'wss://iot.mymockendpoint.org:443/notrealmqtt',
+				});
+				pubsub.addPluggable(awsIotProvider);
+
+				const sub = pubsub.subscribe('topic', { clientId: '123' }).subscribe({
+					error: () => {},
+				});
+
+				await hubConnectionListener.waitUntilConnectionStateIn(['Connected']);
+
+				reachabilityObserver?.next?.({ online: false });
+				await hubConnectionListener.waitUntilConnectionStateIn([
+					'ConnectedPendingNetwork',
+				]);
+
+				reachabilityObserver?.next?.({ online: true });
+				await hubConnectionListener.waitUntilConnectionStateIn(['Connected']);
+
+				expect(hubConnectionListener.observedConnectionStates).toEqual([
+					'Disconnected',
+					'Connecting',
+					'Connected',
+					'ConnectedPendingNetwork',
+					'Connected',
+				]);
+			});
+
+			test('test network disconnection followed by connection disruption', async () => {
+				const pubsub = new PubSub();
+
+				const awsIotProvider = new AWSIoTProvider({
+					aws_pubsub_region: 'region',
+					aws_pubsub_endpoint: 'wss://iot.mymockendpoint.org:443/notrealmqtt',
+				});
+				pubsub.addPluggable(awsIotProvider);
+
+				const sub = pubsub.subscribe('topic', { clientId: '123' }).subscribe({
+					error: () => {},
+				});
+
+				await hubConnectionListener.waitUntilConnectionStateIn(['Connected']);
+
+				reachabilityObserver?.next?.({ online: false });
+				await hubConnectionListener.waitUntilConnectionStateIn([
+					'ConnectedPendingNetwork',
+				]);
+
+				awsIotProvider.onDisconnect({ errorCode: 1, clientId: '123' });
+				await hubConnectionListener.waitUntilConnectionStateIn([
+					'Disconnected',
+				]);
+
+				expect(hubConnectionListener.observedConnectionStates).toEqual([
+					'Disconnected',
+					'Connecting',
+					'Connected',
+					'ConnectedPendingNetwork',
+					'Disconnected',
+				]);
+			});
 		});
 	});
 

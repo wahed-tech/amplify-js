@@ -117,15 +117,12 @@ class IndexedDBAdapter implements Adapter {
 
 								Object.keys(namespace.models).forEach(modelName => {
 									const storeName = this.getStorename(namespaceName, modelName);
-									const store = db.createObjectStore(storeName, {
-										autoIncrement: true,
-									});
-
-									const indexes = this.schema.namespaces[namespaceName]
-										.relationships[modelName].indexes;
-									indexes.forEach(index => store.createIndex(index, index));
-
-									store.createIndex('byId', 'id', { unique: true });
+									this.createObjectStoreForModel(
+										db,
+										namespaceName,
+										storeName,
+										modelName
+									);
 								});
 							});
 
@@ -166,6 +163,31 @@ class IndexedDBAdapter implements Adapter {
 
 									logger.debug(`${count} ${storeName} records migrated`);
 								}
+
+								// add new models created after IndexedDB, but before migration
+								// this case may happen when a user has not opened an app for
+								// some time and a new model is added during that time
+								Object.keys(theSchema.namespaces).forEach(namespaceName => {
+									const namespace = theSchema.namespaces[namespaceName];
+									const objectStoreNames = new Set(txn.objectStoreNames);
+
+									Object.keys(namespace.models)
+										.map(modelName => {
+											return [
+												modelName,
+												this.getStorename(namespaceName, modelName),
+											];
+										})
+										.filter(([, storeName]) => !objectStoreNames.has(storeName))
+										.forEach(([modelName, storeName]) => {
+											this.createObjectStoreForModel(
+												db,
+												namespaceName,
+												storeName,
+												modelName
+											);
+										});
+								});
 							} catch (error) {
 								logger.error('Error migrating IndexedDB data', error);
 								txn.abort();
@@ -228,6 +250,7 @@ class IndexedDBAdapter implements Adapter {
 				return { storeName, item, instance };
 			}
 		);
+
 		const tx = this.db.transaction(
 			[storeName, ...Array.from(set.values())],
 			'readwrite'
@@ -310,16 +333,17 @@ class IndexedDBAdapter implements Adapter {
 			switch (relation.relationType) {
 				case 'HAS_ONE':
 					for await (const recordItem of records) {
-						if (recordItem[fieldName]) {
-							const connectionRecord = await this._get(
-								store,
-								recordItem[fieldName]
-							);
+						const getByfield = recordItem[targetName] ? targetName : fieldName;
+						if (!recordItem[getByfield]) break;
 
-							recordItem[fieldName] =
-								connectionRecord &&
-								this.modelInstanceCreator(modelConstructor, connectionRecord);
-						}
+						const connectionRecord = await this._get(
+							store,
+							recordItem[getByfield]
+						);
+
+						recordItem[fieldName] =
+							connectionRecord &&
+							this.modelInstanceCreator(modelConstructor, connectionRecord);
 					}
 
 					break;
@@ -533,9 +557,9 @@ class IndexedDBAdapter implements Adapter {
 			const storeName = this.getStorenameForModel(modelConstructor);
 
 			const models = await this.query(modelConstructor, condition);
-			const relations = this.schema.namespaces[nameSpace].relationships[
-				modelConstructor.name
-			].relationTypes;
+			const relations =
+				this.schema.namespaces[nameSpace].relationships[modelConstructor.name]
+					.relationTypes;
 
 			if (condition !== undefined) {
 				await this.deleteTraverse(
@@ -611,9 +635,9 @@ class IndexedDBAdapter implements Adapter {
 				}
 				await tx.done;
 
-				const relations = this.schema.namespaces[nameSpace].relationships[
-					modelConstructor.name
-				].relationTypes;
+				const relations =
+					this.schema.namespaces[nameSpace].relationships[modelConstructor.name]
+						.relationTypes;
 
 				await this.deleteTraverse(
 					relations,
@@ -623,9 +647,9 @@ class IndexedDBAdapter implements Adapter {
 					deleteQueue
 				);
 			} else {
-				const relations = this.schema.namespaces[nameSpace].relationships[
-					modelConstructor.name
-				].relationTypes;
+				const relations =
+					this.schema.namespaces[nameSpace].relationships[modelConstructor.name]
+						.relationTypes;
 
 				await this.deleteTraverse(
 					relations,
@@ -709,12 +733,15 @@ class IndexedDBAdapter implements Adapter {
 
 						const hasOneCustomField = targetName in model;
 						const value = hasOneCustomField ? model[targetName] : model.id;
+						if (!value) break;
 
-						const recordToDelete = <T>await this.db
-							.transaction(storeName, 'readwrite')
-							.objectStore(storeName)
-							.index(hasOneIndex)
-							.get(value);
+						const recordToDelete = <T>(
+							await this.db
+								.transaction(storeName, 'readwrite')
+								.objectStore(storeName)
+								.index(hasOneIndex)
+								.get(value)
+						);
 
 						await this.deleteTraverse(
 							this.schema.namespaces[nameSpace].relationships[modelName]
@@ -827,6 +854,23 @@ class IndexedDBAdapter implements Adapter {
 		await txn.done;
 
 		return result;
+	}
+
+	private async createObjectStoreForModel(
+		db: idb.IDBPDatabase,
+		namespaceName: string,
+		storeName: string,
+		modelName: string
+	) {
+		const store = db.createObjectStore(storeName, {
+			autoIncrement: true,
+		});
+
+		const indexes =
+			this.schema.namespaces[namespaceName].relationships[modelName].indexes;
+		indexes.forEach(index => store.createIndex(index, index));
+
+		store.createIndex('byId', 'id', { unique: true });
 	}
 }
 

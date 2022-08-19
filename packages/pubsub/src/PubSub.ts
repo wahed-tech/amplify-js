@@ -20,7 +20,7 @@ import {
 	INTERNAL_AWS_APPSYNC_PUBSUB_PROVIDER,
 	INTERNAL_AWS_APPSYNC_REALTIME_PUBSUB_PROVIDER,
 } from '@aws-amplify/core';
-import { PubSubProvider, PubSubOptions, ProvidertOptions } from './types';
+import { PubSubProvider, PubSubOptions, ProviderOptions } from './types';
 import { AWSAppSyncProvider, AWSAppSyncRealTimeProvider } from './Providers';
 
 const { isNode } = browserOrNode();
@@ -34,12 +34,12 @@ export class PubSubClass {
 	/**
 	 * Internal instance of AWSAppSyncProvider used by the API category to subscribe to AppSync
 	 */
-	private _awsAppSyncProvider: AWSAppSyncProvider;
+	private _awsAppSyncProvider?: AWSAppSyncProvider;
 
 	/**
 	 * Internal instance of AWSAppSyncRealTimeProvider used by the API category to subscribe to AppSync
 	 */
-	private _awsAppSyncRealTimeProvider: AWSAppSyncRealTimeProvider;
+	private _awsAppSyncRealTimeProvider?: AWSAppSyncRealTimeProvider;
 
 	/**
 	 * Lazy instantiate AWSAppSyncProvider when it is required by the API category
@@ -68,8 +68,8 @@ export class PubSubClass {
 	 *
 	 * @param {PubSubOptions} options - Configuration object for PubSub
 	 */
-	constructor(options: PubSubOptions) {
-		this._options = options;
+	constructor(options?: PubSubOptions) {
+		this._options = options ?? {};
 		logger.debug('PubSub Options', this._options);
 		this._pluggables = [];
 		this.subscribe = this.subscribe.bind(this);
@@ -110,7 +110,17 @@ export class PubSubClass {
 		}
 	}
 
-	private getProviderByName(providerName) {
+	/**
+	 * remove plugin from PubSub category
+	 * @param providerName - the name of the plugin
+	 */
+	removePluggable(providerName: string): void {
+		this._pluggables = this._pluggables.filter(
+			pluggable => pluggable.getProviderName() !== providerName
+		);
+	}
+
+	private getProviderByName(providerName: string | symbol) {
 		if (providerName === INTERNAL_AWS_APPSYNC_PUBSUB_PROVIDER) {
 			return this.awsAppSyncProvider;
 		}
@@ -123,7 +133,7 @@ export class PubSubClass {
 		);
 	}
 
-	private getProviders(options: ProvidertOptions = {}) {
+	private getProviders(options: ProviderOptions = {}) {
 		const { provider: providerName } = options;
 		if (!providerName) {
 			return this._pluggables;
@@ -140,7 +150,7 @@ export class PubSubClass {
 	async publish(
 		topics: string[] | string,
 		msg: any,
-		options?: ProvidertOptions
+		options?: ProviderOptions
 	) {
 		return Promise.all(
 			this.getProviders(options).map(provider =>
@@ -151,7 +161,7 @@ export class PubSubClass {
 
 	subscribe(
 		topics: string[] | string,
-		options?: ProvidertOptions
+		options?: ProviderOptions
 	): Observable<any> {
 		if (isNode && this._options && this._options.ssr) {
 			throw new Error(
@@ -184,5 +194,5 @@ export class PubSubClass {
 	}
 }
 
-export const PubSub = new PubSubClass(null);
+export const PubSub = new PubSubClass();
 Amplify.register(PubSub);

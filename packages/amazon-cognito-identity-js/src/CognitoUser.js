@@ -1,18 +1,6 @@
 /*!
- * Copyright 2016 Amazon.com,
- * Inc. or its affiliates. All Rights Reserved.
- *
- * Licensed under the Amazon Software License (the "License").
- * You may not use this file except in compliance with the
- * License. A copy of the License is located at
- *
- *     http://aws.amazon.com/asl/
- *
- * or in the "license" file accompanying this file. This file is
- * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
- * CONDITIONS OF ANY KIND, express or implied. See the License
- * for the specific language governing permissions and
- * limitations under the License.
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { Buffer } from 'buffer';
@@ -503,6 +491,7 @@ export default class CognitoUser {
 		}
 
 		if (challengeName === 'DEVICE_SRP_AUTH') {
+			this.Session = dataAuthenticate.Session;
 			this.getDeviceResponse(callback);
 			return undefined;
 		}
@@ -672,6 +661,7 @@ export default class CognitoUser {
 				ClientId: this.pool.getClientId(),
 				ChallengeResponses: authParameters,
 				ClientMetadata: clientMetadata,
+				Session: this.Session,
 			};
 			if (this.getUserContextData()) {
 				jsonReq.UserContextData = this.getUserContextData();
@@ -1339,7 +1329,11 @@ export default class CognitoUser {
 				if (err) {
 					return callback(err, null);
 				}
-				return callback(null, 'SUCCESS');
+
+				// update cached user
+				return this.getUserData(() => callback(null, 'SUCCESS'), {
+					bypassCache: true,
+				});
 			}
 		);
 		return undefined;
@@ -1391,8 +1385,9 @@ export default class CognitoUser {
 			return callback(null, this.signInUserSession);
 		}
 
-		const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${this.username
-			}`;
+		const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${
+			this.username
+		}`;
 		const idTokenKey = `${keyPrefix}.idToken`;
 		const accessTokenKey = `${keyPrefix}.accessToken`;
 		const refreshTokenKey = `${keyPrefix}.refreshToken`;
@@ -1555,8 +1550,9 @@ export default class CognitoUser {
 	 * @returns {void}
 	 */
 	cacheDeviceKeyAndPassword() {
-		const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${this.username
-			}`;
+		const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${
+			this.username
+		}`;
 		const deviceKeyKey = `${keyPrefix}.deviceKey`;
 		const randomPasswordKey = `${keyPrefix}.randomPasswordKey`;
 		const deviceGroupKeyKey = `${keyPrefix}.deviceGroupKey`;
@@ -1571,8 +1567,9 @@ export default class CognitoUser {
 	 * @returns {void}
 	 */
 	getCachedDeviceKeyAndPassword() {
-		const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${this.username
-			}`;
+		const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${
+			this.username
+		}`;
 		const deviceKeyKey = `${keyPrefix}.deviceKey`;
 		const randomPasswordKey = `${keyPrefix}.randomPasswordKey`;
 		const deviceGroupKeyKey = `${keyPrefix}.deviceGroupKey`;
@@ -1589,8 +1586,9 @@ export default class CognitoUser {
 	 * @returns {void}
 	 */
 	clearCachedDeviceKeyAndPassword() {
-		const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${this.username
-			}`;
+		const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${
+			this.username
+		}`;
 		const deviceKeyKey = `${keyPrefix}.deviceKey`;
 		const randomPasswordKey = `${keyPrefix}.randomPasswordKey`;
 		const deviceGroupKeyKey = `${keyPrefix}.deviceGroupKey`;
@@ -1694,7 +1692,7 @@ export default class CognitoUser {
 			if (err) {
 				return callback.onFailure(err);
 			}
-			return callback.onSuccess();
+			return callback.onSuccess('SUCCESS');
 		});
 	}
 
@@ -1726,7 +1724,7 @@ export default class CognitoUser {
 				if (typeof callback.inputVerificationCode === 'function') {
 					return callback.inputVerificationCode(data);
 				}
-				return callback.onSuccess();
+				return callback.onSuccess('SUCCESS');
 			}
 		);
 		return undefined;
@@ -1964,7 +1962,7 @@ export default class CognitoUser {
 	 */
 	signOut(revokeTokenCallback) {
 		// If tokens won't be revoked, we just clean the client data.
-		if (!revokeTokenCallback || typeof revokeTokenCallback !== "function") {
+		if (!revokeTokenCallback || typeof revokeTokenCallback !== 'function') {
 			this.cleanClientData();
 
 			return;
@@ -1975,7 +1973,7 @@ export default class CognitoUser {
 				return revokeTokenCallback(error);
 			}
 
-			this.revokeTokens((err) => {
+			this.revokeTokens(err => {
 				this.cleanClientData();
 
 				revokeTokenCallback(err);
@@ -1983,9 +1981,9 @@ export default class CognitoUser {
 		});
 	}
 
-	revokeTokens(revokeTokenCallback = () => { }) {
+	revokeTokens(revokeTokenCallback = () => {}) {
 		if (typeof revokeTokenCallback !== 'function') {
-			throw new Error('Invalid revokeTokenCallback. It should be a function.')
+			throw new Error('Invalid revokeTokenCallback. It should be a function.');
 		}
 
 		const tokensToBeRevoked = [];
@@ -2007,7 +2005,10 @@ export default class CognitoUser {
 
 		if (this.isSessionRevocable(accessToken)) {
 			if (refreshToken) {
-				return this.revokeToken({ token: refreshToken, callback: revokeTokenCallback });
+				return this.revokeToken({
+					token: refreshToken,
+					callback: revokeTokenCallback,
+				});
 			}
 		}
 		revokeTokenCallback();
@@ -2036,17 +2037,16 @@ export default class CognitoUser {
 			'RevokeToken',
 			{
 				Token: token,
-				ClientId: this.pool.getClientId()
+				ClientId: this.pool.getClientId(),
 			},
 			err => {
-
 				if (err) {
 					return callback(err);
 				}
 
 				callback();
 			}
-		)
+		);
 	}
 
 	/**

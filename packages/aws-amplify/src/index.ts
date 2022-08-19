@@ -24,6 +24,7 @@ Amplify.ServiceWorker = ServiceWorker;
 
 export {
 	Analytics,
+	AnalyticsProvider,
 	AWSPinpointProvider,
 	AWSKinesisProvider,
 	AWSKinesisFirehoseProvider,
@@ -54,8 +55,10 @@ export {
 	Signer,
 	I18n,
 	ServiceWorker,
+	AWSCloudWatchProvider,
 } from '@aws-amplify/core';
 export { withSSRContext } from './withSSRContext';
+export { Geo } from '@aws-amplify/geo';
 
 export { Amplify };
 

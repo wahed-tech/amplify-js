@@ -104,6 +104,15 @@ export const authErrorMessages: AuthErrorMessages = {
 	noUserSession: {
 		message: AuthErrorStrings.NO_USER_SESSION,
 	},
+	deviceConfig: {
+		message: AuthErrorStrings.DEVICE_CONFIG,
+	},
+	networkError: {
+		message: AuthErrorStrings.NETWORK_ERROR,
+	},
+	autoSignInError: {
+		message: AuthErrorStrings.AUTOSIGNIN_ERROR,
+	},
 	default: {
 		message: AuthErrorStrings.DEFAULT_MSG,
 	},

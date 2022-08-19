@@ -112,11 +112,9 @@ export default class Client {
 				// Taken from aws-sdk-js/lib/protocol/json.js
 				// eslint-disable-next-line no-underscore-dangle
 				const code = (data.__type || data.code).split('#').pop();
-				const error = {
-					code,
-					name: code,
-					message: data.message || data.Message || null,
-				};
+				const error = new Error(data.message || data.Message || null)
+				error.name = code
+				error.code = code
 				return callback(error);
 			})
 			.catch(err => {
@@ -128,27 +126,19 @@ export default class Client {
 				) {
 					try {
 						const code = response.headers.get('x-amzn-errortype').split(':')[0];
-						const error = {
-							code,
-							name: code,
-							statusCode: response.status,
-							message: response.status ? response.status.toString() : null,
-						};
+						const error = new Error(response.status ? response.status.toString() : null)
+						error.code = code
+						error.name = code
+						error.statusCode = response.status
 						return callback(error);
 					} catch (ex) {
 						return callback(err);
 					}
 					// otherwise check if error is Network error
 				} else if (err instanceof Error && err.message === 'Network error') {
-					const error = {
-						code: 'NetworkError',
-						name: err.name,
-						message: err.message,
-					};
-					return callback(error);
-				} else {
-					return callback(err);
+					err.code = 'NetworkError'
 				}
+				return callback(err);
 			});
 	}
 }
@@ -174,17 +164,14 @@ const isNonRetryableError = (obj) => {
 	return obj && obj[key];
 };
 
-async function retry(functionToRetry, args, delayFn, attempt = 1) {
+function retry(functionToRetry, args, delayFn, attempt = 1) {
 	if (typeof functionToRetry !== 'function') {
 		throw Error('functionToRetry must be a function');
 	}
 
 	logger.debug(`${functionToRetry.name} attempt #${attempt} with args: ${JSON.stringify(args)}`);
 
-	try {
-		return await functionToRetry(...args);
-	}
-	catch (err) {
+	return functionToRetry(...args).catch((err) => {
 		logger.debug(`error on ${functionToRetry.name}`, err);
 
 		if (isNonRetryableError(err)) {
@@ -197,13 +184,12 @@ async function retry(functionToRetry, args, delayFn, attempt = 1) {
 		logger.debug(`${functionToRetry.name} retrying in ${retryIn} ms`);
 
 		if (retryIn !== false) {
-			await new Promise(res => setTimeout(res, retryIn));
-			return await retry(functionToRetry, args, delayFn, attempt + 1);
-		}
-		else {
+			return new Promise(res => setTimeout(res, retryIn))
+					.then(() => retry(functionToRetry, args, delayFn, attempt + 1))
+		} else {
 			throw err;
 		}
-	}
+	})
 }
 
 function jitteredBackoff(maxDelayMs) {

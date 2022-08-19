@@ -1,4 +1,7 @@
+import API from '@aws-amplify/api';
 import { Amplify, ConsoleLogger as Logger, Hub, JS } from '@aws-amplify/core';
+import { Auth } from '@aws-amplify/auth';
+import Cache from '@aws-amplify/cache';
 import {
 	Draft,
 	immerable,
@@ -16,6 +19,7 @@ import {
 	ModelSortPredicateCreator,
 	PredicateAll,
 } from '../predicates';
+import { Adapter } from '../storage/adapter';
 import { ExclusiveStorage as Storage } from '../storage/storage';
 import { ControlMessage, SyncEngine } from '../sync';
 import {
@@ -43,12 +47,17 @@ import {
 	SchemaNamespace,
 	SchemaNonModel,
 	SubscriptionMessage,
+	DataStoreSnapshot,
 	SyncConflict,
 	SyncError,
 	TypeConstructorMap,
 	ErrorHandler,
 	SyncExpression,
 	AuthModeStrategyType,
+	isNonModelFieldType,
+	isModelFieldType,
+	ObserveQueryOptions,
+	AmplifyContext,
 } from '../types';
 import {
 	DATASTORE,
@@ -61,6 +70,11 @@ import {
 	SYNC,
 	USER,
 	isNullOrUndefined,
+	registerNonModelClass,
+	sortCompareFunction,
+	DeferredCallbackResolver,
+	validatePredicate,
+	mergePatches,
 } from '../util';
 
 setAutoFreeze(true);
@@ -214,6 +228,20 @@ const initSchema = (userSchema: Schema) => {
 	return userClasses;
 };
 
+/* Checks if the schema has been initialized by initSchema().
+ *
+ * Call this function before accessing schema.
+ * Currently this only needs to be called in start() and clear() because all other functions will call start first.
+ */
+const checkSchemaInitialized = () => {
+	if (schema === undefined) {
+		const message =
+			'Schema is not initialized. DataStore will not function as expected. This could happen if you have multiple versions of DataStore installed. Please see https://docs.amplify.aws/lib/troubleshooting/upgrading/q/platform/js/#check-for-duplicate-versions';
+		logger.error(message);
+		throw new Error(message);
+	}
+};
+
 const createTypeClasses: (
 	namespace: SchemaNamespace
 ) => TypeConstructorMap = namespace => {
@@ -250,93 +278,129 @@ function modelInstanceCreator<T extends PersistentModel = PersistentModel>(
 	return <T>new modelConstructor(init);
 }
 
-const validateModelFields = (modelDefinition: SchemaModel | SchemaNonModel) => (
+const validateModelFields =
+	(modelDefinition: SchemaModel | SchemaNonModel) => (k: string, v: any) => {
+		const fieldDefinition = modelDefinition.fields[k];
+
+		if (fieldDefinition !== undefined) {
+			const { type, isRequired, isArrayNullable, name, isArray } =
+				fieldDefinition;
+
+			if (
+				((!isArray && isRequired) || (isArray && !isArrayNullable)) &&
+				(v === null || v === undefined)
+			) {
+				throw new Error(`Field ${name} is required`);
+			}
+
+			if (isGraphQLScalarType(type)) {
+				const jsType = GraphQLScalarType.getJSType(type);
+				const validateScalar = GraphQLScalarType.getValidationFunction(type);
+
+				if (type === 'AWSJSON') {
+					if (typeof v === jsType) {
+						return;
+					}
+					if (typeof v === 'string') {
+						try {
+							JSON.parse(v);
+							return;
+						} catch (error) {
+							throw new Error(`Field ${name} is an invalid JSON object. ${v}`);
+						}
+					}
+				}
+
+				if (isArray) {
+					let errorTypeText: string = jsType;
+					if (!isRequired) {
+						errorTypeText = `${jsType} | null | undefined`;
+					}
+
+					if (!Array.isArray(v) && !isArrayNullable) {
+						throw new Error(
+							`Field ${name} should be of type [${errorTypeText}], ${typeof v} received. ${v}`
+						);
+					}
+
+					if (
+						!isNullOrUndefined(v) &&
+						(<[]>v).some(e =>
+							isNullOrUndefined(e) ? isRequired : typeof e !== jsType
+						)
+					) {
+						const elemTypes = (<[]>v)
+							.map(e => (e === null ? 'null' : typeof e))
+							.join(',');
+
+						throw new Error(
+							`All elements in the ${name} array should be of type ${errorTypeText}, [${elemTypes}] received. ${v}`
+						);
+					}
+
+					if (validateScalar && !isNullOrUndefined(v)) {
+						const validationStatus = (<[]>v).map(e => {
+							if (!isNullOrUndefined(e)) {
+								return validateScalar(e);
+							} else if (isNullOrUndefined(e) && !isRequired) {
+								return true;
+							} else {
+								return false;
+							}
+						});
+
+						if (!validationStatus.every(s => s)) {
+							throw new Error(
+								`All elements in the ${name} array should be of type ${type}, validation failed for one or more elements. ${v}`
+							);
+						}
+					}
+				} else if (!isRequired && v === undefined) {
+					return;
+				} else if (typeof v !== jsType && v !== null) {
+					throw new Error(
+						`Field ${name} should be of type ${jsType}, ${typeof v} received. ${v}`
+					);
+				} else if (
+					!isNullOrUndefined(v) &&
+					validateScalar &&
+					!validateScalar(v)
+				) {
+					throw new Error(
+						`Field ${name} should be of type ${type}, validation failed. ${v}`
+					);
+				}
+			}
+		}
+	};
+
+const castInstanceType = (
+	modelDefinition: SchemaModel | SchemaNonModel,
 	k: string,
 	v: any
 ) => {
-	const fieldDefinition = modelDefinition.fields[k];
-
-	if (fieldDefinition !== undefined) {
-		const {
-			type,
-			isRequired,
-			isArrayNullable,
-			name,
-			isArray,
-		} = fieldDefinition;
-
-		if (
-			((!isArray && isRequired) || (isArray && !isArrayNullable)) &&
-			(v === null || v === undefined)
-		) {
-			throw new Error(`Field ${name} is required`);
-		}
-
-		if (isGraphQLScalarType(type)) {
-			const jsType = GraphQLScalarType.getJSType(type);
-			const validateScalar = GraphQLScalarType.getValidationFunction(type);
-
-			if (isArray) {
-				let errorTypeText: string = jsType;
-				if (!isRequired) {
-					errorTypeText = `${jsType} | null | undefined`;
-				}
-
-				if (!Array.isArray(v) && !isArrayNullable) {
-					throw new Error(
-						`Field ${name} should be of type [${errorTypeText}], ${typeof v} received. ${v}`
-					);
-				}
-
-				if (
-					!isNullOrUndefined(v) &&
-					(<[]>v).some(e =>
-						isNullOrUndefined(e) ? isRequired : typeof e !== jsType
-					)
-				) {
-					const elemTypes = (<[]>v)
-						.map(e => (e === null ? 'null' : typeof e))
-						.join(',');
-
-					throw new Error(
-						`All elements in the ${name} array should be of type ${errorTypeText}, [${elemTypes}] received. ${v}`
-					);
-				}
-
-				if (validateScalar && !isNullOrUndefined(v)) {
-					const validationStatus = (<[]>v).map(e => {
-						if (!isNullOrUndefined(e)) {
-							return validateScalar(e);
-						} else if (isNullOrUndefined(e) && !isRequired) {
-							return true;
-						} else {
-							return false;
-						}
-					});
-
-					if (!validationStatus.every(s => s)) {
-						throw new Error(
-							`All elements in the ${name} array should be of type ${type}, validation failed for one or more elements. ${v}`
-						);
-					}
-				}
-			} else if (!isRequired && v === undefined) {
-				return;
-			} else if (typeof v !== jsType && v !== null) {
-				throw new Error(
-					`Field ${name} should be of type ${jsType}, ${typeof v} received. ${v}`
-				);
-			} else if (
-				!isNullOrUndefined(v) &&
-				validateScalar &&
-				!validateScalar(v)
-			) {
-				throw new Error(
-					`Field ${name} should be of type ${type}, validation failed. ${v}`
-				);
-			}
+	const { isArray, type } = modelDefinition.fields[k] || {};
+	// attempt to parse stringified JSON
+	if (
+		typeof v === 'string' &&
+		(isArray ||
+			type === 'AWSJSON' ||
+			isNonModelFieldType(type) ||
+			isModelFieldType(type))
+	) {
+		try {
+			return JSON.parse(v);
+		} catch {
+			// if JSON is invalid, don't throw and let modelValidator handle it
 		}
 	}
+
+	// cast from numeric representation of boolean to JS boolean
+	if (typeof v === 'number' && type === 'Boolean') {
+		return Boolean(v);
+	}
+
+	return v;
 };
 
 const initializeInstance = <T>(
@@ -346,8 +410,10 @@ const initializeInstance = <T>(
 ) => {
 	const modelValidator = validateModelFields(modelDefinition);
 	Object.entries(init).forEach(([k, v]) => {
-		modelValidator(k, v);
-		(<any>draft)[k] = v;
+		const parsedValue = castInstanceType(modelDefinition, k, v);
+
+		modelValidator(k, parsedValue);
+		(<any>draft)[k] = parsedValue;
 	});
 };
 
@@ -361,11 +427,10 @@ const createModelClass = <T extends PersistentModel>(
 				(draft: Draft<T & ModelInstanceMetadata>) => {
 					initializeInstance(init, modelDefinition, draft);
 
-					const modelInstanceMetadata: ModelInstanceMetadata = instancesMetadata.has(
-						init
-					)
-						? <ModelInstanceMetadata>(<unknown>init)
-						: <ModelInstanceMetadata>{};
+					const modelInstanceMetadata: ModelInstanceMetadata =
+						instancesMetadata.has(init)
+							? <ModelInstanceMetadata>(<unknown>init)
+							: <ModelInstanceMetadata>{};
 					const {
 						id: _id,
 						_version,
@@ -373,13 +438,18 @@ const createModelClass = <T extends PersistentModel>(
 						_deleted,
 					} = modelInstanceMetadata;
 
-					const id =
-						// instancesIds is set by modelInstanceCreator, it is accessible only internally
-						_id !== null && _id !== undefined
-							? _id
-							: modelDefinition.syncable
-							? uuid4()
-							: ulid();
+					// instancesIds are set by modelInstanceCreator, it is accessible only internally
+					const isInternal = _id !== null && _id !== undefined;
+
+					const id = isInternal
+						? _id
+						: modelDefinition.syncable
+						? uuid4()
+						: ulid();
+
+					if (!isInternal) {
+						checkReadOnlyPropertyOnCreate(draft, modelDefinition);
+					}
 
 					draft.id = id;
 
@@ -406,18 +476,33 @@ const createModelClass = <T extends PersistentModel>(
 			const model = produce(
 				source,
 				draft => {
-					fn(<MutableModel<T>>draft);
+					fn(<MutableModel<T>>(draft as unknown));
 					draft.id = source.id;
 					const modelValidator = validateModelFields(modelDefinition);
 					Object.entries(draft).forEach(([k, v]) => {
-						modelValidator(k, v);
+						const parsedValue = castInstanceType(modelDefinition, k, v);
+
+						modelValidator(k, parsedValue);
 					});
 				},
 				p => (patches = p)
 			);
 
-			if (patches.length) {
-				modelPatchesMap.set(model, [patches, source]);
+			const hasExistingPatches = modelPatchesMap.has(source);
+			if (patches.length || hasExistingPatches) {
+				if (hasExistingPatches) {
+					const [existingPatches, existingSource] = modelPatchesMap.get(source);
+					const mergedPatches = mergePatches(
+						existingSource,
+						existingPatches,
+						patches
+					);
+					modelPatchesMap.set(model, [mergedPatches, existingSource]);
+					checkReadOnlyPropertyOnUpdate(mergedPatches, modelDefinition);
+				} else {
+					modelPatchesMap.set(model, [patches, source]);
+					checkReadOnlyPropertyOnUpdate(patches, modelDefinition);
+				}
 			}
 
 			return model;
@@ -448,6 +533,36 @@ const createModelClass = <T extends PersistentModel>(
 	return clazz;
 };
 
+const checkReadOnlyPropertyOnCreate = <T extends PersistentModel>(
+	draft: T,
+	modelDefinition: SchemaModel
+) => {
+	const modelKeys = Object.keys(draft);
+	const { fields } = modelDefinition;
+
+	modelKeys.forEach(key => {
+		if (fields[key] && fields[key].isReadOnly) {
+			throw new Error(`${key} is read-only.`);
+		}
+	});
+};
+
+const checkReadOnlyPropertyOnUpdate = (
+	patches: Patch[],
+	modelDefinition: SchemaModel
+) => {
+	const patchArray = patches.map(p => [p.path[0], p.value]);
+	const { fields } = modelDefinition;
+
+	patchArray.forEach(([key, val]) => {
+		if (!val || !fields[key]) return;
+
+		if (fields[key].isReadOnly) {
+			throw new Error(`${key} is read-only.`);
+		}
+	});
+};
+
 const createNonModelClass = <T>(typeDefinition: SchemaNonModel) => {
 	const clazz = <NonModelTypeConstructor<T>>(<unknown>class Model {
 		constructor(init: ModelInit<T>) {
@@ -466,6 +581,8 @@ const createNonModelClass = <T>(typeDefinition: SchemaNonModel) => {
 
 	Object.defineProperty(clazz, 'name', { value: typeDefinition.name });
 
+	registerNonModelClass(clazz);
+
 	return clazz;
 };
 
@@ -479,7 +596,7 @@ function defaultConflictHandler(conflictData: SyncConflict): PersistentModel {
 	return modelInstanceCreator(modelConstructor, { ...localModel, _version });
 }
 
-function defaultErrorHandler(error: SyncError) {
+function defaultErrorHandler(error: SyncError<PersistentModel>): void {
 	logger.warn(error);
 }
 
@@ -521,9 +638,8 @@ async function checkSchemaVersion(
 	storage: Storage,
 	version: string
 ): Promise<void> {
-	const Setting = dataStoreClasses.Setting as PersistentModelConstructor<
-		Setting
-	>;
+	const Setting =
+		dataStoreClasses.Setting as PersistentModelConstructor<Setting>;
 
 	const modelDefinition = schema.namespaces[DATASTORE].models.Setting;
 
@@ -598,10 +714,15 @@ function getNamespace(): SchemaNamespace {
 }
 
 class DataStore {
+	// reference to configured category instances. Used for preserving SSR context
+	private Auth = Auth;
+	private API = API;
+	private Cache = Cache;
+
 	private amplifyConfig: Record<string, any> = {};
 	private authModeStrategy: AuthModeStrategy;
 	private conflictHandler: ConflictHandler;
-	private errorHandler: (error: SyncError) => void;
+	private errorHandler: (error: SyncError<PersistentModel>) => void;
 	private fullSyncInterval: number;
 	private initialized: Promise<void>;
 	private initReject: Function;
@@ -611,11 +732,16 @@ class DataStore {
 	private sync: SyncEngine;
 	private syncPageSize: number;
 	private syncExpressions: SyncExpression[];
-	private syncPredicates: WeakMap<
-		SchemaModel,
-		ModelPredicate<any>
-	> = new WeakMap<SchemaModel, ModelPredicate<any>>();
+	private syncPredicates: WeakMap<SchemaModel, ModelPredicate<any>> =
+		new WeakMap<SchemaModel, ModelPredicate<any>>();
 	private sessionId: string;
+	private storageAdapter: Adapter;
+	// object that gets passed to descendent classes. Allows us to pass these down by reference
+	private amplifyContext: AmplifyContext = {
+		Auth: this.Auth,
+		API: this.API,
+		Cache: this.Cache,
+	};
 
 	getModuleName() {
 		return 'DataStore';
@@ -639,12 +765,13 @@ class DataStore {
 			namespaceResolver,
 			getModelConstructorByModelName,
 			modelInstanceCreator,
-			undefined,
+			this.storageAdapter,
 			this.sessionId
 		);
 
 		await this.storage.init();
 
+		checkSchemaInitialized();
 		await checkSchemaVersion(this.storage, schema.version);
 
 		const { aws_appsync_graphqlEndpoint } = this.amplifyConfig;
@@ -661,13 +788,12 @@ class DataStore {
 				userClasses,
 				this.storage,
 				modelInstanceCreator,
-				this.maxRecordsToSync,
-				this.syncPageSize,
 				this.conflictHandler,
 				this.errorHandler,
 				this.syncPredicates,
 				this.amplifyConfig,
-				this.authModeStrategy
+				this.authModeStrategy,
+				this.amplifyContext
 			);
 
 			// tslint:disable-next-line:max-line-length
@@ -1042,10 +1168,37 @@ class DataStore {
 			(async () => {
 				await this.start();
 
+				// Filter the events returned by Storage according to namespace,
+				// append original element data, and subscribe to the observable
 				handle = this.storage
 					.observe(modelConstructor, predicate)
 					.filter(({ model }) => namespaceResolver(model) === USER)
-					.subscribe(observer);
+					.subscribe({
+						next: async item => {
+							// the `element` doesn't necessarily contain all item details or
+							// have related records attached consistently with that of a query()
+							// result item. for consistency, we attach them here.
+
+							let message = item;
+
+							// as lnog as we're not dealing with a DELETE, we need to fetch a fresh
+							// item from storage to ensure it's fully populated.
+							if (item.opType !== 'DELETE') {
+								const freshElement = await this.query(
+									item.model,
+									item.element.id
+								);
+								message = {
+									...message,
+									element: freshElement as T,
+								};
+							}
+
+							observer.next(message as SubscriptionMessage<T>);
+						},
+						error: err => observer.error(err),
+						complete: () => observer.complete(),
+					});
 			})();
 
 			return () => {
@@ -1056,7 +1209,234 @@ class DataStore {
 		});
 	};
 
+	observeQuery: {
+		<T extends PersistentModel>(
+			modelConstructor: PersistentModelConstructor<T>,
+			criteria?: ProducerModelPredicate<T> | typeof PredicateAll,
+			paginationProducer?: ObserveQueryOptions<T>
+		): Observable<DataStoreSnapshot<T>>;
+	} = <T extends PersistentModel = PersistentModel>(
+		model: PersistentModelConstructor<T>,
+		criteria?: ProducerModelPredicate<T> | typeof PredicateAll,
+		options?: ObserveQueryOptions<T>
+	): Observable<DataStoreSnapshot<T>> => {
+		return new Observable<DataStoreSnapshot<T>>(observer => {
+			const items = new Map<string, T>();
+			const itemsChanged = new Map<string, T>();
+			let deletedItemIds: string[] = [];
+			let handle: ZenObservable.Subscription;
+			let predicate: ModelPredicate<T>;
+
+			/**
+			 * As the name suggests, this geneates a snapshot in the form of
+			 * 	`{items: T[], isSynced: boolean}`
+			 * and sends it to the observer.
+			 *
+			 * SIDE EFFECT: The underlying generation and emission methods may touch:
+			 * `items`, `itemsChanged`, and `deletedItemIds`.
+			 *
+			 * Refer to `generateSnapshot` and `emitSnapshot` for more details.
+			 */
+			const generateAndEmitSnapshot = (): void => {
+				const snapshot = generateSnapshot();
+				emitSnapshot(snapshot);
+			};
+
+			// a mechanism to return data after X amount of seconds OR after the
+			// "limit" (itemsChanged >= this.syncPageSize) has been reached, whichever comes first
+			const limitTimerRace = new DeferredCallbackResolver({
+				callback: generateAndEmitSnapshot,
+				errorHandler: observer.error,
+				maxInterval: 2000,
+			});
+
+			const { sort } = options || {};
+			const sortOptions = sort ? { sort } : undefined;
+
+			const modelDefinition = getModelDefinition(model);
+			if (isQueryOne(criteria)) {
+				predicate = ModelPredicateCreator.createForId<T>(
+					modelDefinition,
+					criteria
+				);
+			} else {
+				if (isPredicatesAll(criteria)) {
+					// Predicates.ALL means "all records", so no predicate (undefined)
+					predicate = undefined;
+				} else {
+					predicate = ModelPredicateCreator.createFromExisting(
+						modelDefinition,
+						criteria
+					);
+				}
+			}
+
+			const { predicates, type: predicateGroupType } =
+				ModelPredicateCreator.getPredicates(predicate, false) || {};
+			const hasPredicate = !!predicates;
+
+			(async () => {
+				try {
+					// first, query and return any locally-available records
+					(await this.query(model, criteria, sortOptions)).forEach(item =>
+						items.set(item.id, item)
+					);
+
+					// Observe the model and send a stream of updates (debounced).
+					// We need to post-filter results instead of passing criteria through
+					// to have visibility into items that move from in-set to out-of-set.
+					// We need to explicitly remove those items from the existing snapshot.
+					handle = this.observe(model).subscribe(
+						({ element, model, opType }) => {
+							if (
+								hasPredicate &&
+								!validatePredicate(element, predicateGroupType, predicates)
+							) {
+								if (
+									opType === 'UPDATE' &&
+									(items.has(element.id) || itemsChanged.has(element.id))
+								) {
+									// tracking as a "deleted item" will include the item in
+									// page limit calculations and ensure it is removed from the
+									// final items collection, regardless of which collection(s)
+									// it is currently in. (I mean, it could be in both, right!?)
+									deletedItemIds.push(element.id);
+								} else {
+									// ignore updates for irrelevant/filtered items.
+									return;
+								}
+							}
+
+							// Flag items which have been recently deleted
+							// NOTE: Merging of separate operations to the same model instance is handled upstream
+							// in the `mergePage` method within src/sync/merger.ts. The final state of a model instance
+							// depends on the LATEST record (for a given id).
+							if (opType === 'DELETE') {
+								deletedItemIds.push(element.id);
+							} else {
+								itemsChanged.set(element.id, element);
+							}
+
+							const isSynced = this.sync?.getModelSyncedStatus(model) ?? false;
+
+							const limit =
+								itemsChanged.size - deletedItemIds.length >= this.syncPageSize;
+
+							if (limit || isSynced) {
+								limitTimerRace.resolve();
+							}
+
+							// kicks off every subsequent race as results sync down
+							limitTimerRace.start();
+						}
+					);
+
+					// returns a set of initial/locally-available results
+					generateAndEmitSnapshot();
+				} catch (err) {
+					observer.error(err);
+				}
+			})();
+
+			/**
+			 * Combines the `items`, `itemsChanged`, and `deletedItemIds` collections into
+			 * a snapshot in the form of `{ items: T[], isSynced: boolean}`.
+			 *
+			 * SIDE EFFECT: The shared `items` collection is recreated.
+			 */
+			const generateSnapshot = (): DataStoreSnapshot<T> => {
+				const isSynced = this.sync?.getModelSyncedStatus(model) ?? false;
+				const itemsArray = [
+					...Array.from(items.values()),
+					...Array.from(itemsChanged.values()),
+				];
+
+				if (options?.sort) {
+					sortItems(itemsArray);
+				}
+
+				items.clear();
+				itemsArray.forEach(item => items.set(item.id, item));
+
+				// remove deleted items from the final result set
+				deletedItemIds.forEach(id => items.delete(id));
+
+				return {
+					items: Array.from(items.values()),
+					isSynced,
+				};
+			};
+
+			/**
+			 * Emits the list of items to the observer.
+			 *
+			 * SIDE EFFECT: `itemsChanged` and `deletedItemIds` are cleared to prepare
+			 * for the next snapshot.
+			 *
+			 * @param snapshot The generated items data to emit.
+			 */
+			const emitSnapshot = (snapshot: DataStoreSnapshot<T>): void => {
+				// send the generated snapshot to the primary subscription
+				observer.next(snapshot);
+
+				// reset the changed items sets
+				itemsChanged.clear();
+				deletedItemIds = [];
+			};
+
+			/**
+			 * Sorts an `Array` of `T` according to the sort instructions given in the
+			 * original  `observeQuery()` call.
+			 *
+			 * @param itemsToSort A array of model type.
+			 */
+			const sortItems = (itemsToSort: T[]): void => {
+				const modelDefinition = getModelDefinition(model);
+				const pagination = this.processPagination(modelDefinition, options);
+
+				const sortPredicates = ModelSortPredicateCreator.getPredicates(
+					pagination.sort
+				);
+
+				if (sortPredicates.length) {
+					const compareFn = sortCompareFunction(sortPredicates);
+					itemsToSort.sort(compareFn);
+				}
+			};
+
+			/**
+			 * Force one last snapshot when the model is fully synced.
+			 *
+			 * This reduces latency for that last snapshot, which will otherwise
+			 * wait for the configured timeout.
+			 *
+			 * @param payload The payload from the Hub event.
+			 */
+			const hubCallback = ({ payload }): void => {
+				const { event, data } = payload;
+				if (
+					event === ControlMessage.SYNC_ENGINE_MODEL_SYNCED &&
+					data?.model?.name === model.name
+				) {
+					generateAndEmitSnapshot();
+					Hub.remove('api', hubCallback);
+				}
+			};
+			Hub.listen('datastore', hubCallback);
+
+			return () => {
+				if (handle) {
+					handle.unsubscribe();
+				}
+			};
+		});
+	};
+
 	configure = (config: DataStoreConfig = {}) => {
+		this.amplifyContext.Auth = this.Auth;
+		this.amplifyContext.API = this.API;
+		this.amplifyContext.Cache = this.Cache;
+
 		const {
 			DataStore: configDataStore,
 			authModeStrategyType: configAuthModeStrategyType,
@@ -1066,10 +1446,15 @@ class DataStore {
 			syncPageSize: configSyncPageSize,
 			fullSyncInterval: configFullSyncInterval,
 			syncExpressions: configSyncExpressions,
+			authProviders: configAuthProviders,
+			storageAdapter: configStorageAdapter,
 			...configFromAmplify
 		} = config;
 
-		this.amplifyConfig = { ...configFromAmplify, ...this.amplifyConfig };
+		this.amplifyConfig = {
+			...configFromAmplify,
+			...this.amplifyConfig,
+		};
 
 		this.conflictHandler = this.setConflictHandler(config);
 		this.errorHandler = this.setErrorHandler(config);
@@ -1081,7 +1466,7 @@ class DataStore {
 
 		switch (authModeStrategyType) {
 			case AuthModeStrategyType.MULTI_AUTH:
-				this.authModeStrategy = multiAuthStrategy;
+				this.authModeStrategy = multiAuthStrategy(this.amplifyContext);
 				break;
 			case AuthModeStrategyType.DEFAULT:
 				this.authModeStrategy = defaultAuthStrategy;
@@ -1091,33 +1476,61 @@ class DataStore {
 				break;
 		}
 
+		// store on config object, so that Sync, Subscription, and Mutation processors can have access
+		this.amplifyConfig.authProviders =
+			(configDataStore && configDataStore.authProviders) || configAuthProviders;
+
 		this.syncExpressions =
 			(configDataStore && configDataStore.syncExpressions) ||
-			this.syncExpressions ||
-			configSyncExpressions;
+			configSyncExpressions ||
+			this.syncExpressions;
 
 		this.maxRecordsToSync =
 			(configDataStore && configDataStore.maxRecordsToSync) ||
+			configMaxRecordsToSync ||
 			this.maxRecordsToSync ||
-			configMaxRecordsToSync;
+			10000;
+
+		// store on config object, so that Sync, Subscription, and Mutation processors can have access
+		this.amplifyConfig.maxRecordsToSync = this.maxRecordsToSync;
 
 		this.syncPageSize =
 			(configDataStore && configDataStore.syncPageSize) ||
+			configSyncPageSize ||
 			this.syncPageSize ||
-			configSyncPageSize;
+			1000;
+
+		// store on config object, so that Sync, Subscription, and Mutation processors can have access
+		this.amplifyConfig.syncPageSize = this.syncPageSize;
 
 		this.fullSyncInterval =
 			(configDataStore && configDataStore.fullSyncInterval) ||
-			this.fullSyncInterval ||
 			configFullSyncInterval ||
+			this.fullSyncInterval ||
 			24 * 60; // 1 day
+
+		this.storageAdapter =
+			(configDataStore && configDataStore.storageAdapter) ||
+			configStorageAdapter ||
+			this.storageAdapter ||
+			undefined;
 
 		this.sessionId = this.retrieveSessionId();
 	};
 
 	clear = async function clear() {
+		checkSchemaInitialized();
 		if (this.storage === undefined) {
-			return;
+			// connect to storage so that it can be cleared without fully starting DataStore
+			this.storage = new Storage(
+				schema,
+				namespaceResolver,
+				getModelConstructorByModelName,
+				modelInstanceCreator,
+				this.storageAdapter,
+				this.sessionId
+			);
+			await this.storage.init();
 		}
 
 		if (syncSubscription && !syncSubscription.closed) {
